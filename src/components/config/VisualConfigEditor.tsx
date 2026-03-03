@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useMemo, useState, useEffect, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -23,6 +23,8 @@ import {
   VISUAL_CONFIG_PROTOCOL_OPTIONS,
 } from '@/hooks/useVisualConfig';
 import { maskApiKey } from '@/utils/format';
+import { apiClient } from '@/services/api/client';
+import { authFilesApi } from '@/services/api/authFiles';
 import { isValidApiKeyCharset } from '@/utils/validation';
 
 interface VisualConfigEditorProps {
@@ -81,6 +83,136 @@ function Divider() {
   return <div style={{ height: 1, background: 'var(--border-color)', margin: '16px 0' }} />;
 }
 
+type AuthMappingRecord = Record<string, string[]>;
+type AuthTarget = { authIndex: string; label: string };
+
+const AUTH_INDEX_HEX16 = /^[0-9a-f]{16}$/i;
+
+function normalizeAuthIndex(value: unknown): string {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '';
+  if (AUTH_INDEX_HEX16.test(raw)) return raw.toLowerCase();
+  const m = raw.match(/\b([0-9a-f]{16})\b/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+async function fetchClientAuthMappings(): Promise<AuthMappingRecord> {
+  const payloads: unknown[] = [];
+  try {
+    payloads.push(await apiClient.get('/client-auth-mappings'));
+  } catch {
+    payloads.push(await apiClient.get('/v0/management/client-auth-mappings'));
+  }
+  const payload = payloads[0] as Record<string, unknown>;
+  const source = (payload['client-auth-mappings'] ?? payload.clientAuthMappings ?? payload) as unknown;
+  const out: AuthMappingRecord = {};
+
+  if (Array.isArray(source)) {
+    source.forEach((entry) => {
+      const row = entry as Record<string, unknown>;
+      const idx = normalizeAuthIndex(row['auth-index'] ?? row.authIndex ?? row.index ?? row.id);
+      if (!idx) return;
+      const keys = Array.isArray(row['api-keys'])
+        ? row['api-keys']
+        : Array.isArray(row.apiKeys)
+          ? row.apiKeys
+          : [];
+      out[idx] = Array.from(
+        new Set(keys.map((item) => String(item ?? '').trim()).filter(Boolean))
+      );
+    });
+    return out;
+  }
+
+  if (source && typeof source === 'object') {
+    Object.entries(source as Record<string, unknown>).forEach(([idxRaw, keysRaw]) => {
+      const idx = normalizeAuthIndex(idxRaw);
+      if (!idx) return;
+      const keys = Array.isArray(keysRaw) ? keysRaw : [];
+      out[idx] = Array.from(new Set(keys.map((item) => String(item ?? '').trim()).filter(Boolean)));
+    });
+  }
+
+  return out;
+}
+
+async function saveClientAuthMappings(next: AuthMappingRecord): Promise<void> {
+  try {
+    await apiClient.put('/client-auth-mappings', next);
+  } catch {
+    await apiClient.put('/v0/management/client-auth-mappings', next);
+  }
+}
+
+async function fetchAuthTargets(): Promise<AuthTarget[]> {
+  const data = await authFilesApi.list();
+  const files = Array.isArray(data.files) ? data.files : [];
+  const out: AuthTarget[] = [];
+  const seen = new Set<string>();
+
+  files.forEach((file) => {
+    const idx = normalizeAuthIndex((file as Record<string, unknown>).authIndex ?? (file as Record<string, unknown>)['auth-index']);
+    if (!idx || seen.has(idx)) return;
+    seen.add(idx);
+    const name = String(file.name ?? file.filename ?? '').trim();
+    out.push({ authIndex: idx, label: name ? `${name} (${idx})` : `auth-index ${idx}` });
+  });
+
+  return out.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function normalizeAuthTargetList(targets: AuthTarget[]): AuthTarget[] {
+  const seen = new Set<string>();
+  return targets
+    .filter((item) => {
+      const idx = normalizeAuthIndex(item.authIndex);
+      if (!idx || seen.has(idx)) return false;
+      seen.add(idx);
+      return true;
+    })
+    .map((item) => {
+      const idx = normalizeAuthIndex(item.authIndex);
+      const label = String(item.label ?? '').trim();
+      return { authIndex: idx, label: label || `auth-index ${idx}` };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+async function syncClientAuthMappings(params: {
+  selectedAuthIndexes: string[];
+  apiKey: string;
+  previousApiKey?: string;
+}): Promise<void> {
+  const apiKey = String(params.apiKey ?? '').trim();
+  if (!apiKey) return;
+
+  const previousApiKey = String(params.previousApiKey ?? '').trim();
+  const selected = new Set(
+    params.selectedAuthIndexes.map((item) => normalizeAuthIndex(item)).filter(Boolean)
+  );
+
+  const current = await fetchClientAuthMappings();
+  const allIndexes = new Set<string>([
+    ...Object.keys(current).map((item) => normalizeAuthIndex(item)).filter(Boolean),
+    ...Array.from(selected),
+  ]);
+
+  const next: AuthMappingRecord = {};
+  allIndexes.forEach((authIndex) => {
+    const currentKeys = Array.isArray(current[authIndex]) ? current[authIndex] : [];
+    const deduped = Array.from(new Set(currentKeys.map((item) => String(item ?? '').trim()).filter(Boolean)));
+    const withoutCurrent = deduped.filter((item) => item !== apiKey);
+    const withoutPrevious =
+      previousApiKey && previousApiKey !== apiKey
+        ? withoutCurrent.filter((item) => item !== previousApiKey)
+        : withoutCurrent;
+
+    next[authIndex] = selected.has(authIndex) ? [...withoutPrevious, apiKey] : withoutPrevious;
+  });
+
+  await saveClientAuthMappings(next);
+}
+
 function ApiKeysCardEditor({
   value,
   disabled,
@@ -105,6 +237,10 @@ function ApiKeysCardEditor({
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [inputValue, setInputValue] = useState('');
   const [formError, setFormError] = useState('');
+  const [mappingTargets, setMappingTargets] = useState<AuthTarget[]>([]);
+  const [mappingSelected, setMappingSelected] = useState<string[]>([]);
+  const [mappingError, setMappingError] = useState('');
+  const [mappingLoading, setMappingLoading] = useState(false);
 
   function generateSecureApiKey(): string {
     const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -112,6 +248,43 @@ function ApiKeysCardEditor({
     crypto.getRandomValues(array);
     return 'sk-' + Array.from(array, (b) => charset[b % charset.length]).join('');
   }
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    let active = true;
+
+    const loadMappings = async () => {
+      setMappingLoading(true);
+      setMappingError('');
+      try {
+        const [targets, mappings] = await Promise.all([fetchAuthTargets(), fetchClientAuthMappings()]);
+        if (!active) return;
+        setMappingTargets(targets);
+
+        const key = String(inputValue || '').trim();
+        if (!key) {
+          setMappingSelected([]);
+        } else {
+          const selected = Object.entries(mappings)
+            .filter(([, keys]) => keys.includes(key))
+            .map(([idx]) => idx);
+          setMappingSelected(selected);
+        }
+      } catch (err) {
+        if (!active) return;
+        const message = err instanceof Error ? err.message : String(err || 'Unknown error');
+        setMappingError(message);
+      } finally {
+        if (active) setMappingLoading(false);
+      }
+    };
+
+    loadMappings();
+
+    return () => {
+      active = false;
+    };
+  }, [modalOpen, inputValue]);
 
   const openAddModal = () => {
     setEditingIndex(null);
@@ -142,7 +315,7 @@ function ApiKeysCardEditor({
     updateApiKeys(apiKeys.filter((_, i) => i !== index));
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     const trimmed = inputValue.trim();
     if (!trimmed) {
       setFormError(t('config_management.visual.api_keys.error_empty'));
@@ -153,11 +326,38 @@ function ApiKeysCardEditor({
       return;
     }
 
+    const previousKey = editingIndex !== null ? String(apiKeys[editingIndex] ?? '').trim() : '';
+
     const nextKeys =
       editingIndex === null
         ? [...apiKeys, trimmed]
         : apiKeys.map((key, idx) => (idx === editingIndex ? trimmed : key));
+
     updateApiKeys(nextKeys);
+
+    try {
+      const mappings = await fetchClientAuthMappings();
+      const selectedSet = new Set(mappingSelected.map((item) => normalizeAuthIndex(item)).filter(Boolean));
+      const allIndexes = new Set<string>([
+        ...Object.keys(mappings),
+        ...mappingTargets.map((target) => target.authIndex),
+      ]);
+
+      const nextMappings: AuthMappingRecord = {};
+      allIndexes.forEach((idx) => {
+        const base = (mappings[idx] ?? []).filter((apiKey) => apiKey !== previousKey && apiKey !== trimmed);
+        if (selectedSet.has(idx)) base.push(trimmed);
+        const deduped = Array.from(new Set(base));
+        if (deduped.length) nextMappings[idx] = deduped;
+      });
+
+      await saveClientAuthMappings(nextMappings);
+      showNotification(t('notification.save_success'), 'success');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err || 'Unknown error');
+      showNotification(`Auth mapping sync failed: ${message}`, 'error');
+    }
+
     closeModal();
   };
 
@@ -258,6 +458,65 @@ function ApiKeysCardEditor({
             </Button>
           }
         />
+
+        <div className="form-group" style={{ marginTop: 12, marginBottom: 0 }}>
+          <label style={{ marginBottom: 6 }}>Auth Mapping</label>
+          <div className="hint" style={{ marginBottom: 8 }}>
+            Select auth-index targets for this API key.
+          </div>
+
+          {mappingLoading ? (
+            <div className="hint">Loading auth mapping data...</div>
+          ) : mappingError ? (
+            <div className="error-box">Failed to load auth mapping data: {mappingError}</div>
+          ) : mappingTargets.length === 0 ? (
+            <div className="hint">No auth-index targets available.</div>
+          ) : (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+                gap: 6,
+                maxHeight: 220,
+                overflow: 'auto',
+                paddingRight: 4,
+              }}
+            >
+              {mappingTargets.map((target) => {
+                const checked = mappingSelected.includes(target.authIndex);
+                return (
+                  <label
+                    key={target.authIndex}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '6px 8px',
+                      border: '1px solid var(--border-color)',
+                      borderRadius: 8,
+                      background: 'var(--bg-secondary)',
+                      cursor: disabled ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      value={target.authIndex}
+                      checked={checked}
+                      disabled={disabled}
+                      onChange={(e) => {
+                        const idx = e.target.value;
+                        setMappingSelected((prev) =>
+                          e.target.checked ? Array.from(new Set([...prev, idx])) : prev.filter((item) => item !== idx)
+                        );
+                      }}
+                    />
+                    <span style={{ fontSize: 13, color: 'var(--text-primary)' }}>{target.label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </Modal>
     </div>
   );
