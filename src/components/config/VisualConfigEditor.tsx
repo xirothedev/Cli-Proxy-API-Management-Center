@@ -144,73 +144,43 @@ async function saveClientAuthMappings(next: AuthMappingRecord): Promise<void> {
   }
 }
 
+async function deriveAuthIndexFromName(name: string): Promise<string> {
+  const clean = String(name ?? '').trim();
+  if (!clean) return '';
+  try {
+    const seed = `file:${clean}`;
+    const bytes = new TextEncoder().encode(seed);
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    const view = new Uint8Array(digest).slice(0, 8);
+    return Array.from(view)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return '';
+  }
+}
+
 async function fetchAuthTargets(): Promise<AuthTarget[]> {
   const data = await authFilesApi.list();
   const files = Array.isArray(data.files) ? data.files : [];
   const out: AuthTarget[] = [];
   const seen = new Set<string>();
 
-  files.forEach((file) => {
-    const idx = normalizeAuthIndex((file as Record<string, unknown>).authIndex ?? (file as Record<string, unknown>)['auth-index']);
-    if (!idx || seen.has(idx)) return;
-    seen.add(idx);
+  for (const file of files) {
     const name = String(file.name ?? file.filename ?? '').trim();
+    let idx = normalizeAuthIndex(
+      (file as Record<string, unknown>).authIndex ??
+        (file as Record<string, unknown>)['auth-index']
+    );
+    if (!idx && name) {
+      idx = await deriveAuthIndexFromName(name);
+    }
+    if (!idx || seen.has(idx)) continue;
+    seen.add(idx);
     out.push({ authIndex: idx, label: name ? `${name} (${idx})` : `auth-index ${idx}` });
-  });
+  }
 
   return out.sort((a, b) => a.label.localeCompare(b.label));
-}
-
-function normalizeAuthTargetList(targets: AuthTarget[]): AuthTarget[] {
-  const seen = new Set<string>();
-  return targets
-    .filter((item) => {
-      const idx = normalizeAuthIndex(item.authIndex);
-      if (!idx || seen.has(idx)) return false;
-      seen.add(idx);
-      return true;
-    })
-    .map((item) => {
-      const idx = normalizeAuthIndex(item.authIndex);
-      const label = String(item.label ?? '').trim();
-      return { authIndex: idx, label: label || `auth-index ${idx}` };
-    })
-    .sort((a, b) => a.label.localeCompare(b.label));
-}
-
-async function syncClientAuthMappings(params: {
-  selectedAuthIndexes: string[];
-  apiKey: string;
-  previousApiKey?: string;
-}): Promise<void> {
-  const apiKey = String(params.apiKey ?? '').trim();
-  if (!apiKey) return;
-
-  const previousApiKey = String(params.previousApiKey ?? '').trim();
-  const selected = new Set(
-    params.selectedAuthIndexes.map((item) => normalizeAuthIndex(item)).filter(Boolean)
-  );
-
-  const current = await fetchClientAuthMappings();
-  const allIndexes = new Set<string>([
-    ...Object.keys(current).map((item) => normalizeAuthIndex(item)).filter(Boolean),
-    ...Array.from(selected),
-  ]);
-
-  const next: AuthMappingRecord = {};
-  allIndexes.forEach((authIndex) => {
-    const currentKeys = Array.isArray(current[authIndex]) ? current[authIndex] : [];
-    const deduped = Array.from(new Set(currentKeys.map((item) => String(item ?? '').trim()).filter(Boolean)));
-    const withoutCurrent = deduped.filter((item) => item !== apiKey);
-    const withoutPrevious =
-      previousApiKey && previousApiKey !== apiKey
-        ? withoutCurrent.filter((item) => item !== previousApiKey)
-        : withoutCurrent;
-
-    next[authIndex] = selected.has(authIndex) ? [...withoutPrevious, apiKey] : withoutPrevious;
-  });
-
-  await saveClientAuthMappings(next);
 }
 
 function ApiKeysCardEditor({
