@@ -168,6 +168,7 @@ async function fetchAuthTargets(): Promise<AuthTarget[]> {
 
   for (const file of files) {
     const name = String(file.name ?? file.filename ?? '').trim();
+    const prefix = String((file as Record<string, unknown>).prefix ?? '').trim();
     let idx = normalizeAuthIndex(
       (file as Record<string, unknown>).authIndex ??
         (file as Record<string, unknown>)['auth-index']
@@ -177,7 +178,8 @@ async function fetchAuthTargets(): Promise<AuthTarget[]> {
     }
     if (!idx || seen.has(idx)) continue;
     seen.add(idx);
-    out.push({ authIndex: idx, label: name ? `${name} (${idx})` : `auth-index ${idx}` });
+    const labelBase = prefix || name || 'auth-index';
+    out.push({ authIndex: idx, label: `${labelBase} (${idx})` });
   }
 
   return out.sort((a, b) => a.label.localeCompare(b.label));
