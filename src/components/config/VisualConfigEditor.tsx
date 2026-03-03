@@ -144,6 +144,27 @@ async function saveClientAuthMappings(next: AuthMappingRecord): Promise<void> {
   }
 }
 
+
+async function fetchAuthFilePrefixByName(name: string): Promise<string> {
+  const clean = String(name ?? '').trim();
+  if (!clean) return '';
+  try {
+    const data = (await apiClient.get(
+      `/auth-files/download?name=${encodeURIComponent(clean)}`
+    )) as Record<string, unknown>;
+    return String(data?.prefix ?? '').trim();
+  } catch {
+    try {
+      const data = (await apiClient.get(
+        `/v0/management/auth-files/download?name=${encodeURIComponent(clean)}`
+      )) as Record<string, unknown>;
+      return String(data?.prefix ?? '').trim();
+    } catch {
+      return '';
+    }
+  }
+}
+
 async function deriveAuthIndexFromName(name: string): Promise<string> {
   const clean = String(name ?? '').trim();
   if (!clean) return '';
@@ -168,7 +189,7 @@ async function fetchAuthTargets(): Promise<AuthTarget[]> {
 
   for (const file of files) {
     const name = String(file.name ?? file.filename ?? '').trim();
-    const prefix = String((file as Record<string, unknown>).prefix ?? '').trim();
+    let prefix = String((file as Record<string, unknown>).prefix ?? '').trim();
     let idx = normalizeAuthIndex(
       (file as Record<string, unknown>).authIndex ??
         (file as Record<string, unknown>)['auth-index']
@@ -177,6 +198,11 @@ async function fetchAuthTargets(): Promise<AuthTarget[]> {
       idx = await deriveAuthIndexFromName(name);
     }
     if (!idx || seen.has(idx)) continue;
+
+    if (!prefix && name) {
+      prefix = await fetchAuthFilePrefixByName(name);
+    }
+
     seen.add(idx);
     const labelBase = prefix || name || 'auth-index';
     out.push({ authIndex: idx, label: `${labelBase} (${idx})` });
